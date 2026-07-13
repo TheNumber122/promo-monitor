@@ -34,13 +34,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // UptimeRobot sweep. On a genuinely new code we ping each
 // instance's /promo endpoint immediately (best-effort).
 // ============================================
-async function pushToInstances(code) {
+async function pushToInstances(code, codeId) {
   if (!INSTANCE_URLS.length) {
     console.log("[MONITOR] [PUSH] No INSTANCE_URLS configured — skipping push");
     return;
   }
 
-  await Promise.allSettled(
+  const results = await Promise.allSettled(
     INSTANCE_URLS.map(async (base) => {
       const url = `${base.replace(/\/$/, "")}/promo`;
       const controller = new AbortController();
@@ -48,14 +48,30 @@ async function pushToInstances(code) {
       try {
         const res = await fetch(url, { signal: controller.signal });
         console.log(`[MONITOR] [PUSH] ${url} → ${res.status}`);
+        return res.ok;
       } catch (e) {
         console.log(`[MONITOR] [PUSH] ${url} failed: ${e.message}`);
+        return false;
       } finally {
         clearTimeout(t);
       }
     }),
   );
-  console.log(`[MONITOR] [PUSH] Notified ${INSTANCE_URLS.length} instance(s) for "${code}"`);
+
+  const ok = results.filter((r) => r.status === "fulfilled" && r.value).length;
+  console.log(`[MONITOR] [PUSH] Notified ${INSTANCE_URLS.length} instance(s) for "${code}" — ${ok} answered OK`);
+
+  // Record fan-out outcome on the code row (best-effort — never blocks push).
+  if (codeId) {
+    try {
+      await supabase
+        .from("promo_codes")
+        .update({ pushed_count: INSTANCE_URLS.length, push_ok_count: ok })
+        .eq("id", codeId);
+    } catch (e) {
+      console.error(`[MONITOR] [PUSH] Outcome record failed: ${e.message}`);
+    }
+  }
 }
 
 // ============================================
@@ -64,6 +80,13 @@ async function pushToInstances(code) {
 let client;
 let lastPollAt = 0;
 const POLL_DEBOUNCE_MS = 5000;
+
+// Lightweight state the 60s heartbeat samples into monitor_heartbeat (the
+// dashboard reads it as uptime). Updated opportunistically by existing flows —
+// no extra Telegram RPCs are made just for the heartbeat.
+let lastSeenMsgIdCache = 0;
+let channelReachable   = false;
+let heartbeatCount     = 0;
 
 // ============================================
 // PROMO EXTRACTION
@@ -122,7 +145,7 @@ function extractPromos(text) {
 // ============================================
 // HANDLE NEW CODE
 // ============================================
-async function handleNewCode(code, meta, rawMessage, push = true) {
+async function handleNewCode(code, meta, rawMessage, push = true, messageAt = null, source = "event") {
   console.log(
     `\n[MONITOR] 🎟️  Code: "${code}"  |  ${meta.stars_amount ?? "?"}⭐  |  ${meta.max_activations ?? "?"} activations`,
   );
@@ -134,6 +157,8 @@ async function handleNewCode(code, meta, rawMessage, push = true) {
       raw_message:     rawMessage.substring(0, 500),
       stars_amount:    meta.stars_amount,
       max_activations: meta.max_activations,
+      message_at:      messageAt, // channel timestamp → detected_at − message_at = reaction lag
+      source,                     // 'event' (real-time) | 'poll' (backup) | 'history' (backfill)
     })
     .select("id")
     .single();
@@ -148,7 +173,7 @@ async function handleNewCode(code, meta, rawMessage, push = true) {
     if (push) {
       console.log(`[MONITOR] Saved to DB (id=${data.id}) — pushing to instances`);
       // Fire-and-forget: wake instances immediately so they redeem before expiry.
-      pushToInstances(code).catch((e) =>
+      pushToInstances(code, data.id).catch((e) =>
         console.error(`[MONITOR] [PUSH] Error: ${e.message}`),
       );
     } else {
@@ -176,6 +201,7 @@ async function getLastSeenMsgId() {
 }
 
 async function setLastSeenMsgId(msgId) {
+  lastSeenMsgIdCache = msgId;
   try {
     await supabase
       .from("monitor_state")
@@ -243,9 +269,10 @@ function registerEventHandler() {
         const msg = event.message;
         if (!msg?.text) return;
 
+        const msgAt = msg.date ? new Date(msg.date * 1000).toISOString() : null;
         const promos = extractPromos(msg.text);
         for (const promo of promos) {
-          await handleNewCode(promo.code, promo, msg.text);
+          await handleNewCode(promo.code, promo, msg.text, true, msgAt, "event");
         }
 
         if (msg.id) await setLastSeenMsgId(msg.id);
@@ -274,6 +301,7 @@ async function pollChannel() {
     const lastSeen = await getLastSeenMsgId();
 
     const messages = await client.getMessages(CHANNEL, { limit: 20 });
+    channelReachable = true;
 
     const newMsgs = messages.filter((m) => m && m.id > lastSeen);
 
@@ -291,9 +319,10 @@ async function pollChannel() {
         continue;
       }
 
+      const msgAt = msg.date ? new Date(msg.date * 1000).toISOString() : null;
       const promos = extractPromos(msg.text);
       for (const promo of promos) {
-        await handleNewCode(promo.code, promo, msg.text);
+        await handleNewCode(promo.code, promo, msg.text, true, msgAt, "poll");
       }
 
       if (msg.id > maxId) maxId = msg.id;
@@ -302,6 +331,7 @@ async function pollChannel() {
     await setLastSeenMsgId(maxId);
     console.log(`[MONITOR] [POLL] Updated last_seen_msg_id → ${maxId}`);
   } catch (e) {
+    channelReachable = false;
     console.error(`[MONITOR] [POLL] Error: ${e.message}`);
   }
 }
@@ -333,7 +363,8 @@ async function checkHistory() {
 
         if (!data) {
           console.log(`[MONITOR] Untracked historical code: "${promo.code}"`);
-          await handleNewCode(promo.code, promo, msg.text, false);
+          const msgAt = msg.date ? new Date(msg.date * 1000).toISOString() : null;
+          await handleNewCode(promo.code, promo, msg.text, false, msgAt, "history");
           found++;
           await sleep(500);
         } else {
@@ -349,6 +380,29 @@ async function checkHistory() {
     console.log(`[MONITOR] History scan complete — ${found} new code(s), last_seen_msg_id = ${maxId}`);
   } catch (e) {
     console.error(`[MONITOR] History scan failed: ${e.message}`);
+  }
+}
+
+// ============================================
+// HEARTBEAT — liveness sample every 60s (dashboard reads it as uptime).
+// Downtime is inferred from gaps in this series. Best-effort: a failed write
+// can never crash the monitor or affect promo detection.
+// ============================================
+async function writeHeartbeat() {
+  try {
+    await supabase.from("monitor_heartbeat").insert({
+      connected:        client?.connected ?? false,
+      channel_ok:       channelReachable,
+      last_seen_msg_id: lastSeenMsgIdCache || null,
+    });
+
+    // Prune ~hourly (every 60 beats) — keep a rolling 7 days.
+    if (++heartbeatCount % 60 === 0) {
+      const cutoff = new Date(Date.now() - 7 * 86400_000).toISOString();
+      await supabase.from("monitor_heartbeat").delete().lt("ts", cutoff);
+    }
+  } catch (e) {
+    console.error(`[MONITOR] Heartbeat failed: ${e.message}`);
   }
 }
 
@@ -446,6 +500,13 @@ async function main() {
 
   console.log(`[MONITOR] ⏱️  Interval polling every 30s`);
   console.log(`[MONITOR] 🌐 HTTP polling on every GET / hit`);
+
+  // Heartbeat — liveness sample every 60s for the dashboard uptime view.
+  writeHeartbeat();
+  setInterval(() => {
+    writeHeartbeat().catch((e) => console.error(`[MONITOR] Heartbeat error: ${e.message}`));
+  }, 60_000);
+  console.log(`[MONITOR] 💓 Heartbeat every 60s`);
 
   // Graceful shutdown
   process.on("SIGINT", async () => {
