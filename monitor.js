@@ -97,10 +97,14 @@ function extractPromos(text) {
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    if (!line.includes("Ловите дейли промо")) continue;
+    // Trigger phrase varies: "промо", "промик", "промокод", occasional typos.
+    // Match the stable stem "Ловите дейли про" so diminutives don't slip past.
+    if (!/Ловите\s+дейли\s+про/i.test(line)) continue;
 
-    const starsMatch       = line.match(/на\s+(\d+)\s*⭐/);
-    const activationsMatch = line.match(/(\d+)\s+активаций/);
+    // Stars emoji varies across posts: ⭐ / ⭐️ / 🌟, and "и" may hug the emoji
+    // with no space ("2 🌟и 1200"). Anchor on the number after "на" instead.
+    const starsMatch       = line.match(/на\s+(\d+)\s*(?:⭐️?|🌟|звёзд|star)/i);
+    const activationsMatch = line.match(/(\d+)\s+активаци/);
 
     let codeLine = "";
     const colonPos = line.lastIndexOf(":");
