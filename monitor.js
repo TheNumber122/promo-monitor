@@ -83,7 +83,17 @@ async function pushToInstances(code, codeId) {
 // ============================================
 let client;
 let lastPollAt = 0;
-const POLL_DEBOUNCE_MS = 5000;
+const POLL_DEBOUNCE_MS = 2000;
+
+// Resolved numeric id of @patrickstarsfarm. The event handler matches on THIS,
+// never on the username: GramJS's `chats` filter resolves usernames lazily and
+// silently drops every event if that resolution fails (events/common.js
+// filter() returns nothing while !resolved) — which is why detections were
+// always src=poll. A channel's numeric id never changes.
+let channelId = null;
+
+// FLOOD_WAIT backoff for the fast poll (5s cadence needs a brake, just in case)
+let pollBackoffUntil = 0;
 
 // Lightweight state the 60s heartbeat samples into monitor_heartbeat (the
 // dashboard reads it as uptime). Updated opportunistically by existing flows —
@@ -136,6 +146,7 @@ function extractPromos(text) {
       !code ||
       code.includes("http") ||
       code.includes("t.me") ||
+      code.includes("telegram.me") ||
       code.length < 2 ||
       code.length > 60
     ) continue;
@@ -241,6 +252,7 @@ async function ensureConnected() {
     );
     await client.connect();
     await joinChannel(client);
+    await resolveChannelId();
     registerEventHandler();
     console.log("[MONITOR] ✅ Reconnected");
     return true;
@@ -269,27 +281,54 @@ async function joinChannel(c) {
 
 // ============================================
 // EVENT HANDLER — primary real-time detection
+// Registered WITHOUT a `chats` filter: GramJS's chats-filter drops all events
+// silently if its lazy username resolution fails. We match the resolved
+// numeric channelId ourselves — reliable and visible.
 // ============================================
+let eventHandlerRef = null;
+
 function registerEventHandler() {
-  client.addEventHandler(
-    async (event) => {
-      try {
-        const msg = event.message;
-        if (!msg?.text) return;
+  // Never stack duplicate handlers across reconnects
+  if (eventHandlerRef) {
+    try { client.removeEventHandler(eventHandlerRef.cb, eventHandlerRef.ev); } catch (_) {}
+    eventHandlerRef = null;
+  }
 
-        const msgAt = msg.date ? new Date(msg.date * 1000).toISOString() : null;
-        const promos = extractPromos(msg.text);
-        for (const promo of promos) {
-          await handleNewCode(promo.code, promo, msg.text, true, msgAt, "event");
-        }
+  const cb = async (event) => {
+    try {
+      const msg = event.message;
+      if (!msg?.text) return;
 
-        if (msg.id) await setLastSeenMsgId(msg.id);
-      } catch (e) {
-        console.error(`[MONITOR] Handler error: ${e.message}`);
+      // Match our channel by resolved numeric id (fall back to accepting all
+      // if resolution failed — extractPromos is strict enough to not misfire).
+      if (channelId && event.chatId && event.chatId.toString() !== channelId) return;
+
+      const msgAt = msg.date ? new Date(msg.date * 1000).toISOString() : null;
+      const promos = extractPromos(msg.text);
+      for (const promo of promos) {
+        await handleNewCode(promo.code, promo, msg.text, true, msgAt, "event");
       }
-    },
-    new NewMessage({ chats: [CHANNEL] }),
-  );
+
+      if (msg.id) await setLastSeenMsgId(msg.id);
+    } catch (e) {
+      console.error(`[MONITOR] Handler error: ${e.message}`);
+    }
+  };
+  const ev = new NewMessage({});
+  client.addEventHandler(cb, ev);
+  eventHandlerRef = { cb, ev };
+}
+
+// Resolve the channel's numeric id once per connection (cheap, from cache).
+async function resolveChannelId() {
+  try {
+    const entity = await client.getEntity(CHANNEL);
+    channelId = entity.id.toString();
+    console.log(`[MONITOR] Resolved @${CHANNEL} → id ${channelId}`);
+  } catch (e) {
+    console.error(`[MONITOR] ⚠️  Could not resolve @${CHANNEL} id: ${e.message} — handler will accept all chats`);
+    channelId = null;
+  }
 }
 
 // ============================================
@@ -298,6 +337,7 @@ function registerEventHandler() {
 async function pollChannel() {
   const now = Date.now();
   if (now - lastPollAt < POLL_DEBOUNCE_MS) return;
+  if (now < pollBackoffUntil) return; // FLOOD_WAIT brake
   lastPollAt = now;
 
   try {
@@ -306,17 +346,16 @@ async function pollChannel() {
       return;
     }
 
-    const lastSeen = await getLastSeenMsgId();
+    const lastSeen = lastSeenMsgIdCache || (await getLastSeenMsgId());
 
-    const messages = await client.getMessages(CHANNEL, { limit: 20 });
+    // limit 5, not 20 — this runs every 5s; the channel never posts 5 messages
+    // in one window, and the startup history scan covers deeper backfill.
+    const messages = await client.getMessages(CHANNEL, { limit: 5 });
     channelReachable = true;
 
     const newMsgs = messages.filter((m) => m && m.id > lastSeen);
 
-    if (!newMsgs.length) {
-      console.log(`[MONITOR] [POLL] No new messages (last_seen=${lastSeen}, checked ${messages.length})`);
-      return;
-    }
+    if (!newMsgs.length) return; // silent — logging "no new" every 5s is noise
 
     console.log(`[MONITOR] [POLL] ${newMsgs.length} new message(s) since last seen (id=${lastSeen})`);
 
@@ -340,7 +379,14 @@ async function pollChannel() {
     console.log(`[MONITOR] [POLL] Updated last_seen_msg_id → ${maxId}`);
   } catch (e) {
     channelReachable = false;
-    console.error(`[MONITOR] [POLL] Error: ${e.message}`);
+    // Respect FLOOD_WAIT_N: back off exactly as long as Telegram asks
+    const flood = (e.message || "").match(/FLOOD_WAIT_(\d+)/);
+    if (flood) {
+      pollBackoffUntil = Date.now() + (parseInt(flood[1]) + 1) * 1000;
+      console.error(`[MONITOR] [POLL] FLOOD_WAIT — backing off ${flood[1]}s`);
+    } else {
+      console.error(`[MONITOR] [POLL] Error: ${e.message}`);
+    }
   }
 }
 
@@ -449,7 +495,8 @@ async function main() {
   // Catch-up scan on startup (20 messages)
   await checkHistory();
 
-  // Register real-time event handler (primary detection)
+  // Resolve channel numeric id, then register real-time event handler
+  await resolveChannelId();
   registerEventHandler();
   console.log(`[MONITOR] 👂 Event listener active on @${CHANNEL}`);
 
@@ -501,12 +548,15 @@ async function main() {
 
   app.listen(PORT, () => console.log(`[MONITOR] Keep-alive on :${PORT}`));
 
-  // Interval polling — every 30s as safety net
+  // Interval polling — every 5s. This is the WORKHORSE detection path:
+  // the event layer silently starves on idle sessions (see registerEventHandler),
+  // so worst-case detection must come from here. 5s cadence + limit 5 is one
+  // tiny getMessages call — negligible even on 0.1 CPU, FLOOD-guarded above.
   setInterval(() => {
     pollChannel().catch((e) => console.error(`[MONITOR] [INTERVAL] Error: ${e.message}`));
-  }, 30_000);
+  }, 5_000);
 
-  console.log(`[MONITOR] ⏱️  Interval polling every 30s`);
+  console.log(`[MONITOR] ⏱️  Interval polling every 5s`);
   console.log(`[MONITOR] 🌐 HTTP polling on every GET / hit`);
 
   // Heartbeat — liveness sample every 60s for the dashboard uptime view.
