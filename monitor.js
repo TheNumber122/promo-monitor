@@ -21,9 +21,13 @@ const INSTANCE_URLS = (process.env.INSTANCE_URLS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
+// Prefer the service_role key so writes (heartbeat/promo inserts) bypass RLS.
+// Falls back to the anon key when service_role isn't set. A silent RLS denial on
+// monitor_heartbeat is what makes the dashboard show ONLINE (live /health) while
+// the uptime bar goes red (no heartbeat rows) — see writeHeartbeat().
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY,
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY,
 );
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
