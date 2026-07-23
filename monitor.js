@@ -608,14 +608,25 @@ async function main() {
     }
   }, 30_000);
 
-  // ── Recovery poll — only fires if event handler is dead ──
-  // If no event has been received in 2 minutes, the event handler may have
-  // stalled. Do ONE getMessages check to catch up, then go back to waiting.
-  // This is a safety net, not the primary detection path.
+  // ── Recovery poll — only fires if event handler WAS alive but stopped ──
+  // Don't poll on fresh start (event handler may just be waiting for a message).
+  // Only poll if the event handler fired at least once AND then went silent for 2+ min.
+  let eventHandlerEverFired = false;
+  const origSetLastSeen = setLastSeenMsgId;
+  // Patch: mark when event handler first fires (done via lastEventFiredAt already)
+  const startupGraceMs = 3 * 60_000; // 3 min grace after startup — don't poll, let keepalive work
+  const startupTime = Date.now();
+
   setInterval(() => {
-    const sinceEvent = lastEventFiredAt ? Math.round((Date.now() - lastEventFiredAt) / 1000) : null;
-    if (lastEventFiredAt > 0 && sinceEvent < 120) return; // event handler alive
-    console.log(`[MONITOR] [RECOVERY] No event ${sinceEvent != null ? sinceEvent + 's ago' : 'yet'} — polling once`);
+    const alive = Date.now() - startupTime < startupGraceMs;
+    if (alive) return; // still in startup grace — don't poll yet
+
+    // Only poll if event handler fired at least once, then went stale
+    if (!lastEventFiredAt) return; // never fired = no messages yet, don't waste RPCs
+    const sinceEvent = Math.round((Date.now() - lastEventFiredAt) / 1000);
+    if (sinceEvent < 120) return; // event handler alive
+
+    console.log(`[MONITOR] [RECOVERY] Event stale (${sinceEvent}s ago) — polling once`);
     pollChannel().catch((e) => console.error(`[MONITOR] [RECOVERY] Error: ${e.message}`));
   }, 15_000);
 
