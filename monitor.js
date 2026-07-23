@@ -621,12 +621,17 @@ async function main() {
     const alive = Date.now() - startupTime < startupGraceMs;
     if (alive) return; // still in startup grace — don't poll yet
 
-    // Only poll if event handler fired at least once, then went stale
-    if (!lastEventFiredAt) return; // never fired = no messages yet, don't waste RPCs
-    const sinceEvent = Math.round((Date.now() - lastEventFiredAt) / 1000);
-    if (sinceEvent < 120) return; // event handler alive
+    // If event handler fired recently, it's working — skip
+    if (lastEventFiredAt && (Date.now() - lastEventFiredAt) < 120_000) return;
 
-    console.log(`[MONITOR] [RECOVERY] Event stale (${sinceEvent}s ago) — polling once`);
+    const sinceEvent = lastEventFiredAt
+      ? Math.round((Date.now() - lastEventFiredAt) / 1000)
+      : null;
+
+    const reason = sinceEvent == null
+      ? "Event never fired — polling as safety net"
+      : `Event stale (${sinceEvent}s ago) — polling once`;
+    console.log(`[MONITOR] [RECOVERY] ${reason}`);
     pollChannel().catch((e) => console.error(`[MONITOR] [RECOVERY] Error: ${e.message}`));
   }, 15_000);
 
