@@ -83,7 +83,7 @@ async function pushToInstances(code, codeId) {
 // ============================================
 let client;
 let lastPollAt = 0;
-const POLL_DEBOUNCE_MS = 2000;
+const POLL_DEBOUNCE_MS = 200;
 
 // Resolved numeric id of @patrickstarsfarm. The event handler matches on THIS,
 // never on the username: GramJS's `chats` filter resolves usernames lazily and
@@ -92,7 +92,7 @@ const POLL_DEBOUNCE_MS = 2000;
 // always src=poll. A channel's numeric id never changes.
 let channelId = null;
 
-// FLOOD_WAIT backoff for the fast poll (5s cadence needs a brake, just in case)
+// FLOOD_WAIT backoff for the fast poll (500ms cadence needs a brake, just in case)
 let pollBackoffUntil = 0;
 
 // Lightweight state the 60s heartbeat samples into monitor_heartbeat (the
@@ -165,8 +165,12 @@ function extractPromos(text) {
 // HANDLE NEW CODE
 // ============================================
 async function handleNewCode(code, meta, rawMessage, push = true, messageAt = null, source = "event") {
+  const detectedAt = Date.now();
+  const msgTs = messageAt ? new Date(messageAt).getTime() : null;
+  const reactionLag = msgTs ? `${((detectedAt - msgTs) / 1000).toFixed(1)}s since posted` : "unknown lag";
+
   console.log(
-    `\n[MONITOR] 🎟️  Code: "${code}"  |  ${meta.stars_amount ?? "?"}⭐  |  ${meta.max_activations ?? "?"} activations`,
+    `\n[MONITOR] 🎟️  Code: "${code}"  |  ${meta.stars_amount ?? "?"}⭐  |  ${meta.max_activations ?? "?"} activations  |  ${source}  |  ${reactionLag}`,
   );
 
   const { data, error } = await supabase
@@ -189,14 +193,15 @@ async function handleNewCode(code, meta, rawMessage, push = true, messageAt = nu
     }
     console.error(`[MONITOR] DB insert error: ${error.message}`);
   } else {
+    const savedMs = Date.now() - detectedAt;
     if (push) {
-      console.log(`[MONITOR] Saved to DB (id=${data.id}) — pushing to instances`);
+      console.log(`[MONITOR] Saved to DB (id=${data.id}) in ${savedMs}ms — pushing to instances`);
       // Fire-and-forget: wake instances immediately so they redeem before expiry.
       pushToInstances(code, data.id).catch((e) =>
         console.error(`[MONITOR] [PUSH] Error: ${e.message}`),
       );
     } else {
-      console.log(`[MONITOR] Saved to DB (id=${data.id}) — startup backfill, not pushing`);
+      console.log(`[MONITOR] Saved to DB (id=${data.id}) in ${savedMs}ms — startup backfill, not pushing`);
     }
   }
 }
@@ -303,6 +308,7 @@ function registerEventHandler() {
       // if resolution failed — extractPromos is strict enough to not misfire).
       if (channelId && event.chatId && event.chatId.toString() !== channelId) return;
 
+      console.log(`[MONITOR] [EVENT] msg_id=${msg.id} chat=${event.chatId}`);
       const msgAt = msg.date ? new Date(msg.date * 1000).toISOString() : null;
       const promos = extractPromos(msg.text);
       for (const promo of promos) {
@@ -548,15 +554,16 @@ async function main() {
 
   app.listen(PORT, () => console.log(`[MONITOR] Keep-alive on :${PORT}`));
 
-  // Interval polling — every 5s. This is the WORKHORSE detection path:
+  // Interval polling — every 500ms. This is the WORKHORSE detection path:
   // the event layer silently starves on idle sessions (see registerEventHandler),
-  // so worst-case detection must come from here. 5s cadence + limit 5 is one
-  // tiny getMessages call — negligible even on 0.1 CPU, FLOOD-guarded above.
+  // so worst-case detection must come from here. 500ms cadence + limit 5 is one
+  // tiny getMessages call — negligible on CPU, FLOOD-guarded above. Promos expire
+  // in ~1-2 min so every second of detection lag is lost activations.
   setInterval(() => {
     pollChannel().catch((e) => console.error(`[MONITOR] [INTERVAL] Error: ${e.message}`));
-  }, 5_000);
+  }, 500);
 
-  console.log(`[MONITOR] ⏱️  Interval polling every 5s`);
+  console.log(`[MONITOR] ⏱️  Interval polling every 500ms`);
   console.log(`[MONITOR] 🌐 HTTP polling on every GET / hit`);
 
   // Heartbeat — liveness sample every 60s for the dashboard uptime view.
