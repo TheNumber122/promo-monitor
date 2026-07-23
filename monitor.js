@@ -1,5 +1,5 @@
 require("dotenv").config();
-const { TelegramClient } = require("telegram");
+const { TelegramClient, Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const { NewMessage } = require("telegram/events");
 const { createClient } = require("@supabase/supabase-js");
@@ -92,8 +92,12 @@ const POLL_DEBOUNCE_MS = 200;
 // always src=poll. A channel's numeric id never changes.
 let channelId = null;
 
-// FLOOD_WAIT backoff for the fast poll (500ms cadence needs a brake, just in case)
+// FLOOD_WAIT backoff for poll (adaptive — grows on consecutive floods)
 let pollBackoffUntil = 0;
+let consecutiveFloods = 0;
+
+// Track when the event handler last fired — skip poll if it's working
+let lastEventFiredAt = 0;
 
 // Lightweight state the 60s heartbeat samples into monitor_heartbeat (the
 // dashboard reads it as uptime). Updated opportunistically by existing flows —
@@ -308,6 +312,11 @@ function registerEventHandler() {
       // if resolution failed — extractPromos is strict enough to not misfire).
       if (channelId && event.chatId && event.chatId.toString() !== channelId) return;
 
+      lastEventFiredAt = Date.now(); // mark event handler alive
+      if (lastEventFiredAt && !globalThis.__firstEventLogged) {
+        console.log(`[MONITOR] 🎯 FIRST EVENT RECEIVED — event handler is WORKING`);
+        globalThis.__firstEventLogged = true;
+      }
       console.log(`[MONITOR] [EVENT] msg_id=${msg.id} chat=${event.chatId}`);
       const msgAt = msg.date ? new Date(msg.date * 1000).toISOString() : null;
       const promos = extractPromos(msg.text);
@@ -338,13 +347,16 @@ async function resolveChannelId() {
 }
 
 // ============================================
-// POLL CHANNEL — backup detection on every / hit
+// POLL CHANNEL — backup detection (only fires when event handler is dead)
 // ============================================
 async function pollChannel() {
   const now = Date.now();
   if (now - lastPollAt < POLL_DEBOUNCE_MS) return;
-  if (now < pollBackoffUntil) return; // FLOOD_WAIT brake
+  if (now < pollBackoffUntil) return;
   lastPollAt = now;
+
+  // If the event handler fired within last 10s, it's working — skip poll
+  if (lastEventFiredAt && (now - lastEventFiredAt) < 10_000) return;
 
   try {
     if (!(await ensureConnected())) {
@@ -354,14 +366,13 @@ async function pollChannel() {
 
     const lastSeen = lastSeenMsgIdCache || (await getLastSeenMsgId());
 
-    // limit 5, not 20 — this runs every 5s; the channel never posts 5 messages
-    // in one window, and the startup history scan covers deeper backfill.
-    const messages = await client.getMessages(CHANNEL, { limit: 5 });
+    // limit 1 — we only need to know if something new exists, not fetch all
+    const messages = await client.getMessages(CHANNEL, { limit: 1 });
     channelReachable = true;
 
     const newMsgs = messages.filter((m) => m && m.id > lastSeen);
 
-    if (!newMsgs.length) return; // silent — logging "no new" every 5s is noise
+    if (!newMsgs.length) return;
 
     console.log(`[MONITOR] [POLL] ${newMsgs.length} new message(s) since last seen (id=${lastSeen})`);
 
@@ -383,13 +394,17 @@ async function pollChannel() {
 
     await setLastSeenMsgId(maxId);
     console.log(`[MONITOR] [POLL] Updated last_seen_msg_id → ${maxId}`);
+    consecutiveFloods = 0; // reset on success
   } catch (e) {
     channelReachable = false;
-    // Respect FLOOD_WAIT_N: back off exactly as long as Telegram asks
     const flood = (e.message || "").match(/FLOOD_WAIT_(\d+)/);
     if (flood) {
-      pollBackoffUntil = Date.now() + (parseInt(flood[1]) + 1) * 1000;
-      console.error(`[MONITOR] [POLL] FLOOD_WAIT — backing off ${flood[1]}s`);
+      consecutiveFloods++;
+      // Exponential backoff: first flood = Telegram's wait, then double each time, cap at 5 min
+      const baseWait = parseInt(flood[1]) * 1000;
+      const exponentialWait = Math.min(baseWait * Math.pow(2, consecutiveFloods - 1), 300_000);
+      pollBackoffUntil = Date.now() + exponentialWait;
+      console.error(`[MONITOR] [POLL] FLOOD_WAIT — backing off ${Math.round(exponentialWait / 1000)}s (consecutive: ${consecutiveFloods})`);
     } else {
       console.error(`[MONITOR] [POLL] Error: ${e.message}`);
     }
@@ -504,7 +519,17 @@ async function main() {
   // Resolve channel numeric id, then register real-time event handler
   await resolveChannelId();
   registerEventHandler();
-  console.log(`[MONITOR] 👂 Event listener active on @${CHANNEL}`);
+  console.log(`[MONITOR] 👂 Event listener active on @${CHANNEL} (channelId: ${channelId ?? 'unresolved'})`);
+
+  // Startup summary — confirm all systems are ready
+  console.log(`[MONITOR] ── Startup summary ──`);
+  console.log(`[MONITOR]   Connection: ${client?.connected ? '✅' : '❌'}`);
+  console.log(`[MONITOR]   Channel ID: ${channelId ?? '❌ unresolved'}`);
+  console.log(`[MONITOR]   Last seen msg: ${lastSeen}`);
+  console.log(`[MONITOR]   Keepalive: every 5 min (first in 30s)`);
+  console.log(`[MONITOR]   Recovery poll: every 15s (if no event in 2 min)`);
+  console.log(`[MONITOR]   Status log: every 60s`);
+  console.log(`[MONITOR] ────────────────────`);
 
   // Express server
   const app = express();
@@ -554,16 +579,56 @@ async function main() {
 
   app.listen(PORT, () => console.log(`[MONITOR] Keep-alive on :${PORT}`));
 
-  // Interval polling — every 500ms. This is the WORKHORSE detection path:
-  // the event layer silently starves on idle sessions (see registerEventHandler),
-  // so worst-case detection must come from here. 500ms cadence + limit 5 is one
-  // tiny getMessages call — negligible on CPU, FLOOD-guarded above. Promos expire
-  // in ~1-2 min so every second of detection lag is lost activations.
-  setInterval(() => {
-    pollChannel().catch((e) => console.error(`[MONITOR] [INTERVAL] Error: ${e.message}`));
-  }, 500);
+  // ── Update keepalive — forces Telegram to keep pushing updates ──
+  // GramJS's _updateLoop sends pings every 9s to keep the TCP connection alive,
+  // but Telegram stops PUSHING updates if no content-related request is made
+  // within ~30 min. We call updates.GetState() every 5 min to reset that timer.
+  // This is THE fix for "event handler starves on idle sessions."
+  let keepaliveCount = 0;
+  setInterval(async () => {
+    try {
+      const before = Date.now();
+      await client.invoke(new Api.updates.GetState());
+      keepaliveCount++;
+      console.log(`[MONITOR] [KEEPALIVE] #${keepaliveCount} ok — ${Date.now() - before}ms RTT`);
+    } catch (e) {
+      console.error(`[MONITOR] [KEEPALIVE] FAILED: ${e.message}`);
+    }
+  }, 5 * 60_000);
 
-  console.log(`[MONITOR] ⏱️  Interval polling every 500ms`);
+  // Also fire first keepalive after 30s to confirm it works on startup
+  setTimeout(async () => {
+    try {
+      const before = Date.now();
+      await client.invoke(new Api.updates.GetState());
+      keepaliveCount++;
+      console.log(`[MONITOR] [KEEPALIVE] #${keepaliveCount} ok (startup check) — ${Date.now() - before}ms RTT`);
+    } catch (e) {
+      console.error(`[MONITOR] [KEEPALIVE] FAILED (startup check): ${e.message}`);
+    }
+  }, 30_000);
+
+  // ── Recovery poll — only fires if event handler is dead ──
+  // If no event has been received in 2 minutes, the event handler may have
+  // stalled. Do ONE getMessages check to catch up, then go back to waiting.
+  // This is a safety net, not the primary detection path.
+  setInterval(() => {
+    const sinceEvent = lastEventFiredAt ? Math.round((Date.now() - lastEventFiredAt) / 1000) : null;
+    if (lastEventFiredAt > 0 && sinceEvent < 120) return; // event handler alive
+    console.log(`[MONITOR] [RECOVERY] No event ${sinceEvent != null ? sinceEvent + 's ago' : 'yet'} — polling once`);
+    pollChannel().catch((e) => console.error(`[MONITOR] [RECOVERY] Error: ${e.message}`));
+  }, 15_000);
+
+  // Log event handler status every 60s so we can see if it's alive
+  setInterval(() => {
+    const sinceEvent = lastEventFiredAt ? Math.round((Date.now() - lastEventFiredAt) / 1000) : null;
+    const eventStatus = sinceEvent == null ? '⏳ never fired' : sinceEvent < 120 ? `✅ alive (${sinceEvent}s ago)` : `⚠️ STALE (${sinceEvent}s ago)`;
+    const connStatus = client?.connected ? '✅' : '❌';
+    const floodStatus = consecutiveFloods > 0 ? ` | floods: ${consecutiveFloods}` : '';
+    console.log(`[MONITOR] [STATUS] event: ${eventStatus} | conn: ${connStatus} | keepalive: #${keepaliveCount}${floodStatus}`);
+  }, 60_000);
+
+  console.log(`[MONITOR] ⏱️  Update keepalive every 5 min + recovery poll every 15s (event-driven primary)`);
   console.log(`[MONITOR] 🌐 HTTP polling on every GET / hit`);
 
   // Heartbeat — liveness sample every 60s for the dashboard uptime view.
