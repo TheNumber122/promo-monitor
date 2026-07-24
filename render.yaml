@@ -1,24 +1,19 @@
 services:
   - type: worker
     name: promo-monitor
-    runtime: python
-    pythonVersion: 3.12.6
-    buildCommand: pip install -r requirements.txt
-    startCommand: python monitor.py
+    env: node
+    region: oregon
+    plan: free
+    buildCommand: npm install
+    startCommand: node monitor.js
     envVars:
-      - key: API_ID
-        sync: false
-      - key: API_HASH
-        sync: false
-      - key: MONITOR_SESSION
-        sync: false
-      - key: INSTANCE_URLS
-        sync: false
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_ANON_KEY
         sync: false
-      - key: SUPABASE_SERVICE_ROLE_KEY
+      - key: API_ID
         sync: false
-      - key: PORT
-        value: 10001
+      - key: API_HASH
+        sync: false
+      - key: SELFBOT_SESSION
+        sync: false
